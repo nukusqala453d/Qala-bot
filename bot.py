@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
+import sqlite3
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
@@ -15,38 +17,176 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "SİZİN_BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))  # Ózińizdiń Telegram ID ni jazıń
+CARD_NUMBER = "9860350149518655"
 
-TYPES = {"y": "Qara úy", "h": "Apiwayı úy", "b": "Ekewi de"}
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+# --- BAZA BILEN ISLEW (SQLite) ---
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            instagram TEXT,
+            has_house INTEGER DEFAULT 0,
+            house_type TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            order_type TEXT,
+            details TEXT,
+            amount INTEGER,
+            screenshot_id TEXT,
+            status TEXT DEFAULT 'pending',
+            sent_otchet INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
+init_db()
 
+def db_get_user(user_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def db_save_user(user_id, username, full_name, instagram):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO users (user_id, username, full_name, instagram) 
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET instagram=excluded.instagram, username=excluded.username, full_name=excluded.full_name
+    """, (user_id, username, full_name, instagram))
+    conn.commit()
+    conn.close()
+
+def db_update_house_status(user_id, house_type):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET has_house = 1, house_type = ? WHERE user_id = ?", (house_type, user_id))
+    conn.commit()
+    conn.close()
+
+def db_add_order(user_id, order_type, details, amount, screenshot_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO orders (user_id, order_type, details, amount, screenshot_id)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, order_type, details, amount, screenshot_id))
+    conn.commit()
+    order_id = cursor.lastrowid
+    conn.close()
+    return order_id
+
+def db_update_order_status(order_id, status):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+    cursor.execute("SELECT user_id, order_type, details FROM orders WHERE id = ?", (order_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def db_get_unreported_orders():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT o.id, o.user_id, u.instagram, o.order_type, o.details, o.amount, o.created_at 
+        FROM orders o 
+        JOIN users u ON o.user_id = u.user_id 
+        WHERE o.status = 'approved' AND o.sent_otchet = 0
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def db_mark_orders_reported(order_ids):
+    if not order_ids:
+        return
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.executemany("UPDATE orders SET sent_otchet = 1 WHERE id = ?", [(oid,) for oid in order_ids])
+    conn.commit()
+    conn.close()
+
+# --- 10 MOSHINA MARKASI HÁM NARXLARI (100 - 1000 so'm) ---
+CARS = {
+    "c1": {"name": "Chevrolet Spark", "price": 100},
+    "c2": {"name": "UzAuto Damas", "price": 150},
+    "c3": {"name": "Chevrolet Cobalt", "price": 250},
+    "c4": {"name": "Chevrolet Gentra", "price": 350},
+    "c5": {"name": "Chevrolet Tracker", "price": 500},
+    "c6": {"name": "Chevrolet Equinox", "price": 650},
+    "c7": {"name": "BMW M5 F90", "price": 800},
+    "c8": {"name": "Mercedes-Benz G63 (Gelik)", "price": 900},
+    "c9": {"name": "Porsche 911 Turbo S", "price": 950},
+    "c10": {"name": "Lamborghini Urus", "price": 1000},
+}
+
+TYPES_FREE = {"y": "Qara úy", "h": "Ápiwayı úy"}
+
+# --- FSM STATES ---
 class Form(StatesGroup):
     nick = State()
+    free_house_choose = State()
+    custom_house_floors = State()
+    custom_house_desc = State()
+    custom_house_pay = State()
+    business_desc = State()
+    business_pay = State()
+    upgrade_pay = State()
+    car_pay = State()
 
 
-def tg(u):
+def tg_link(u):
     if u.username:
         return "@" + u.username
-    return u.full_name + " (ID: " + str(u.id) + ")"
+    return u.full_name + f" (ID: {u.id})"
 
 
-def keyboard():
+def main_menu_kb(is_owner=False):
     rows = [
-        [InlineKeyboardButton(text=name, callback_data="t:" + code)]
-        for code, name in TYPES.items()
+        [InlineKeyboardButton(text="🏠 Bepul úy qosıw (1 márte)", callback_data="menu:free_house")],
+        [InlineKeyboardButton(text="🏗 Óz dizaynındaǵı úy (1000s + etajı 500s)", callback_data="menu:custom_house")],
+        [InlineKeyboardButton(text="🏢 Biznes / Sawda orayı (5000 so'm)", callback_data="menu:business")],
+        [InlineKeyboardButton(text="🔄 Úydi ózgertiw / Katta úyge ótiw", callback_data="menu:upgrade")],
+        [InlineKeyboardButton(text="🚗 Moshina satıp alıw", callback_data="menu:cars")],
     ]
+    if is_owner:
+        rows.append([InlineKeyboardButton(text="📊 Otchet alıw (Sayttı jańalaw)", callback_data="menu:otchet")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# --- HANDLERS ---
 @dp.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(Form.nick)
-    await m.answer("Sálem! 👋 Instagram nikińizdi jazıń (mısalı: @nikiniz)")
+    user = db_get_user(m.from_user.id)
+    if user and user[3]:  # Eger instagram niki saqlanǵan bolsa
+        is_owner = (m.from_user.id == OWNER_ID)
+        await m.answer(
+            f"Sálem, @{user[3]}! Xosh kelibsiz! 🌟\nTómendegi xizmetlerden birin tańlań:",
+            reply_markup=main_menu_kb(is_owner)
+        )
+    else:
+        await state.set_state(Form.nick)
+        await m.answer("Sálem! 👋 Instagram nikińizdi jazıń (mısalı: @nikiniz)")
 
 
 @dp.message(Form.nick, F.text)
@@ -55,53 +195,362 @@ async def get_nick(m: Message, state: FSMContext):
     if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", n):
         await m.answer("❌ Nik duris emes. Tek Instagram nikińizdi jazıń (mısalı: @nikiniz)")
         return
-    await state.update_data(nick=n)
-    await state.set_state(None)
-    await m.answer("Qanday úy qurasız?", reply_markup=keyboard())
+    
+    db_save_user(m.from_user.id, m.from_user.username, m.from_user.full_name, n)
+    await state.clear()
+    
+    is_owner = (m.from_user.id == OWNER_ID)
+    if is_owner:
+        await m.answer("👑 Assalawma áleykum, Xojayın! Sizge VIP rejim hám Otchet sisteması qosıldı.", reply_markup=main_menu_kb(True))
+    else:
+        await m.answer("✅ Instagram nikińiz saqlandı! Xizmetlerden birin tańlań:", reply_markup=main_menu_kb(False))
 
 
-@dp.callback_query(F.data.startswith("t:"))
-async def choose(c: CallbackQuery, state: FSMContext):
-    code = c.data[2:]
-    data = await state.get_data()
-    n = data.get("nick")
-    if code not in TYPES or not n:
-        await c.answer("/start basıń", show_alert=True)
+# --- MENU CALLBACKS ---
+@dp.callback_query(F.data.startswith("menu:"))
+async def menu_handler(c: CallbackQuery, state: FSMContext):
+    action = c.data.split(":")[1]
+    user_id = c.from_user.id
+    user = db_get_user(user_id)
+
+    if not user or not user[3]:
+        await c.answer("Aldın /start basın hám Instagram nikińizdi kórsetiń!", show_alert=True)
         return
-    row = json.dumps({"n": n, "t": code}, ensure_ascii=False)
+
+    if action == "free_house":
+        if user[4] == 1: # has_house == 1
+            await c.answer("❌ Hárbir telegram akkauntnan tek 1 úy qosıw múmkin!", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(text=name, callback_data=f"free:{code}")] for code, name in TYPES_FREE.items()]
+        await c.message.edit_text("🏡 Bepul úy túrin tańlań:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    elif action == "custom_house":
+        await state.set_state(Form.custom_house_floors)
+        await c.message.edit_text(
+            "🏗 **Óz dizaynıńızdaǵı úy qurıw**\n"
+            "Baza narx: 1000 so'm + hár bir etajı 500 so'm (Maksimal 50 qavat).\n\n"
+            "Qansha etajlı bolıwın san menen jazıń (Mısalı: 3):"
+        )
+
+    elif action == "business":
+        await state.set_state(Form.business_desc)
+        await c.message.edit_text(
+            "🏢 **Biznes / Sawda orayın ashıw**\n"
+            "Xizmat narxı: **5000 so'm**.\n\n"
+            "Biznes yaki sawda orayı haqqında maǵlıwmat yamasa dizaynın jazıp jiberiń:"
+        )
+
+    elif action == "upgrade":
+        if user[4] == 0:
+            await c.answer("Sizde házircha bepul úy joq. Aldın bepul úy alıń!", show_alert=True)
+            return
+        await state.set_state(Form.upgrade_pay)
+        await c.message.edit_text(
+            f"🔄 **Úydi ózgertiw / Katta pulli úyge ótiw**\n"
+            f"Tólem ushın Karta: `{CARD_NUMBER}`\n"
+            "Puldi ótkergennen soń, tólemdi tastiqlawshı **skrinshot** jiberiń:"
+        )
+
+    elif action == "cars":
+        rows = [[InlineKeyboardButton(text=f"{v['name']} — {v['price']} so'm", callback_data=f"car:{k}")] for k, v in CARS.items()]
+        rows.append([InlineKeyboardButton(text="🔙 Artqa", callback_data="menu:back")])
+        await c.message.edit_text("🚗 Satıp alıw múmkin bolǵan moshinalar:\nBirin tańlań:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    elif action == "otchet":
+        if user_id != OWNER_ID:
+            await c.answer("Bul bólim tek Xojayın (Owner) ushın!", show_alert=True)
+            return
+        
+        unreported = db_get_unreported_orders()
+        if not unreported:
+            await c.message.edit_text("📭 Házirshe jańa tastiqlanǵan hám otchetqa kiritilmegen uylar/moshinalar joq.", reply_markup=main_menu_kb(True))
+            return
+        
+        report_text = "📊 **YANGI OTCHET (Sayttı jańalaw ushın):**\n\n"
+        order_ids = []
+        for oid, uid, ig, o_type, details, amt, created in unreported:
+            order_ids.append(oid)
+            report_text += f"🆔 ID: {oid} | 📸 Instagram: @{ig}\n📌 Xizmet: {o_type}\n📝 Maǵlıwmat: {details}\n💰 Summa: {amt} so'm\n📅 Sane: {created}\n-------------------\n"
+        
+        db_mark_orders_reported(order_ids)
+        await c.message.answer(report_text, parse_mode="Markdown")
+        await c.message.answer("Menyu:", reply_markup=main_menu_kb(True))
+
+    elif action == "back":
+        is_owner = (user_id == OWNER_ID)
+        await c.message.edit_text("Bas menyu:", reply_markup=main_menu_kb(is_owner))
+    
+    await c.answer()
+
+
+# --- FREE HOUSE HANDLER ---
+@dp.callback_query(F.data.startswith("free:"))
+async def choose_free_house(c: CallbackQuery):
+    code = c.data.split(":")[1]
+    user_id = c.from_user.id
+    user = db_get_user(user_id)
+    
+    if user[4] == 1:
+        await c.answer("❌ Bir akkauntqa tek 1 úy qosıw múmkin!", show_alert=True)
+        return
+
+    house_name = TYPES_FREE.get(code, "Úy")
+    db_update_house_status(user_id, house_name)
+    
+    # Otchet uchun orders jadvaliga qo'shamiz (bepul bolgani uchun 0 so'm, status approved)
+    db_add_order(user_id, f"Bepul úy ({house_name})", f"Instagram: @{user[3]}", 0, "none")
+
     text = (
-        "🏠 Jańa úy\n"
-        "📸 Instagram: @" + n + "\n"
-        "🏡 " + TYPES[code] + "\n"
-        "👤 Telegram: " + tg(c.from_user) + "\n\n" + row
+        f"🏠 Jańa bepul úy\n"
+        f"📸 Instagram: @{user[3]}\n"
+        f"🏡 {house_name}\n"
+        f"👤 Telegram: {tg_link(c.from_user)}"
     )
-    await bot.send_message(OWNER_ID, text)
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception:
+        pass
+
     await c.message.edit_text(
-        "✅ Qabıl etildi!\n"
-        "📸 @" + n + "\n"
-        "🏡 " + TYPES[code] + "\n\n"
-        "Úyińiz tez arada saytqa qosıladı.\n"
-        "📷 Fotońızdı jibere alasız (májbúriy emes)."
+        f"✅ Qabıl etildi!\n📸 @{user[3]}\n🏡 {house_name}\n\n"
+        "Úyińiz saytqa qosılıwge jiberildi!"
     )
     await c.answer()
 
 
-@dp.message(F.photo)
-async def photo(m: Message, state: FSMContext):
+# --- CUSTOM HOUSE STEPS ---
+@dp.message(Form.custom_house_floors, F.text)
+async def custom_house_floors_handler(m: Message, state: FSMContext):
+    if not m.text.isdigit():
+        await m.answer("❌ Tek san jazıń (mısalı: 2, 3, 5):")
+        return
+    floors = int(m.text)
+    if floors < 1 or floors > 50:
+        await m.answer("❌ Etaj sanı 1 den 50 aralıǵında bolıwı kerek. Qaytadan jazıń:")
+        return
+    
+    price = 1000 + (floors * 500)
+    await state.update_data(floors=floors, price=price)
+    await state.set_state(Form.custom_house_desc)
+    await m.answer(
+        f"🏗 Etajlar sanı: {floors} ta.\n"
+        f"💳 Jemi xizmet narxı: **{price} so'm** (1000 + {floors}*500).\n\n"
+        "Endi óz dizaynıńızdaǵı úy haqqında tolıq maǵlıwmat jazıp jiberiń yamasa súwretin/eskizini jiberiń:"
+    )
+
+@dp.message(Form.custom_house_desc)
+async def custom_house_desc_handler(m: Message, state: FSMContext):
+    desc = m.text or m.caption or "Súwret boyınsha dizayn"
+    await state.update_data(desc=desc)
+    await state.set_state(Form.custom_house_pay)
+    
     data = await state.get_data()
-    n = data.get("nick")
-    who = "@" + n if n else tg(m.from_user)
+    await m.answer(
+        f"💳 Tólem ushın Karta: `{CARD_NUMBER}`\n"
+        f"💰 Ótkeriw kerek bolgan summa: **{data['price']} so'm**\n\n"
+        "Puldi ótkergennen soń, tólemdi tastiqlawshı **skrinshot** jiberiń:"
+    )
+
+@dp.message(Form.custom_house_pay, F.photo)
+async def custom_house_pay_handler(m: Message, state: FSMContext):
+    data = await state.get_data()
+    user = db_get_user(m.from_user.id)
+    screenshot_id = m.photo[-1].file_id
+    
+    order_id = db_add_order(
+        m.from_user.id, 
+        "Dizayn úy", 
+        f"Etaj: {data['floors']}, Descr: {data['desc']}", 
+        data['price'], 
+        screenshot_id
+    )
+    
+    await state.clear()
+    await m.answer("✅ Buyırtpa qabıl etildi! Xojayın tastiqlawın kútisiz.")
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Tastiqlaw", callback_data=f"approve:{order_id}"),
+            InlineKeyboardButton(text="❌ Biykarlaw", callback_data=f"reject:{order_id}")
+        ]
+    ])
     await bot.send_photo(
         OWNER_ID,
-        m.photo[-1].file_id,
-        caption="📷 Foto: " + who,
+        screenshot_id,
+        caption=(
+            f"🔔 **Jańa Dizayn Úy Buyırtpası!**\n"
+            f"🆔 Order ID: {order_id}\n"
+            f"👤 Foydalanıwshı: {tg_link(m.from_user)} (@{user[3]})\n"
+            f"🏗 Etaj: {data['floors']} | 💰 Narx: {data['price']} so'm\n"
+            f"📝 Maǵlıwmat: {data['desc']}"
+        ),
+        reply_markup=markup,
+        parse_mode="Markdown"
     )
-    await m.answer("📷 Foto qabıl etildi!")
+
+
+# --- BUSINESS STEPS ---
+@dp.message(Form.business_desc, F.text)
+async def business_desc_handler(m: Message, state: FSMContext):
+    await state.update_data(desc=m.text, price=5000)
+    await state.set_state(Form.business_pay)
+    await m.answer(
+        f"🏢 Biznes / Sawda orayı narxı: **5000 so'm**.\n"
+        f"Karta: `{CARD_NUMBER}`\n"
+        "Puldi ótkergennen soń **skrinshot** jiberiń:"
+    )
+
+@dp.message(Form.business_pay, F.photo)
+async def business_pay_handler(m: Message, state: FSMContext):
+    data = await state.get_data()
+    user = db_get_user(m.from_user.id)
+    screenshot_id = m.photo[-1].file_id
+    
+    order_id = db_add_order(m.from_user.id, "Biznes / Sawda orayı", data['desc'], 5000, screenshot_id)
+    await state.clear()
+    await m.answer("✅ Biznes buyırtpası qabıl etildi! Xojayın tekseredi.")
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Tastiqlaw", callback_data=f"approve:{order_id}"),
+            InlineKeyboardButton(text="❌ Biykarlaw", callback_data=f"reject:{order_id}")
+        ]
+    ])
+    await bot.send_photo(
+        OWNER_ID, screenshot_id,
+        caption=(
+            f"🔔 **Jańa Biznes / Sawda orayı!**\n"
+            f"🆔 Order ID: {order_id}\n"
+            f"👤 Foydalanıwshı: {tg_link(m.from_user)} (@{user[3]})\n"
+            f"💰 Narx: 5000 so'm\n"
+            f"📝 Maǵlıwmat: {data['desc']}"
+        ),
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+# --- UPGRADE HOUSE ---
+@dp.message(Form.upgrade_pay, F.photo)
+async def upgrade_pay_handler(m: Message, state: FSMContext):
+    user = db_get_user(m.from_user.id)
+    screenshot_id = m.photo[-1].file_id
+    price = 3000  # Katta pulli uyga otish narxi
+    
+    order_id = db_add_order(m.from_user.id, "Úydi ózgertiw (Katta úy)", "Eski bepul úy ornına katta pulli úy", price, screenshot_id)
+    await state.clear()
+    await m.answer("✅ Úydi ózgertiw sorawı jiberildi! Xojayın tastiqlawın kútisiz.")
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Tastiqlaw", callback_data=f"approve:{order_id}"),
+            InlineKeyboardButton(text="❌ Biykarlaw", callback_data=f"reject:{order_id}")
+        ]
+    ])
+    await bot.send_photo(
+        OWNER_ID, screenshot_id,
+        caption=(
+            f"🔔 **Úydi Ózgertiw / Katta Úy Sorawı!**\n"
+            f"🆔 Order ID: {order_id}\n"
+            f"👤 Foydalanıwshı: {tg_link(m.from_user)} (@{user[3]})\n"
+            f"💰 Narx: {price} so'm"
+        ),
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+# --- CAR BUYING ---
+@dp.callback_query(F.data.startswith("car:"))
+async def choose_car(c: CallbackQuery, state: FSMContext):
+    car_key = c.data.split(":")[1]
+    if car_key not in CARS:
+        await c.answer("Moshina tabılmadı", show_alert=True)
+        return
+    
+    car = CARS[car_key]
+    await state.update_data(car_name=car['name'], car_price=car['price'])
+    await state.set_state(Form.car_pay)
+    await c.message.edit_text(
+        f"🚗 Tańlangan moshina: **{car['name']}**\n"
+        f"💰 Narx: **{car['price']} so'm**\n\n"
+        f"💳 Tólem kartası: `{CARD_NUMBER}`\n"
+        "Puldi ótkergennen soń tastiqlawshı **skrinshot** jiberiń:"
+    )
+    await c.answer()
+
+@dp.message(Form.car_pay, F.photo)
+async def car_pay_handler(m: Message, state: FSMContext):
+    data = await state.get_data()
+    user = db_get_user(m.from_user.id)
+    screenshot_id = m.photo[-1].file_id
+    
+    order_id = db_add_order(m.from_user.id, f"Moshina ({data['car_name']})", data['car_name'], data['car_price'], screenshot_id)
+    await state.clear()
+    await m.answer("✅ Moshina satıp alıw buyırtpası qabıl etildi! Xojayın tekseredi.")
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Tastiqlaw", callback_data=f"approve:{order_id}"),
+            InlineKeyboardButton(text="❌ Biykarlaw", callback_data=f"reject:{order_id}")
+        ]
+    ])
+    await bot.send_photo(
+        OWNER_ID, screenshot_id,
+        caption=(
+            f"🔔 **Moshina Satıp Alıw!**\n"
+            f"🆔 Order ID: {order_id}\n"
+            f"👤 Foydalanıwshı: {tg_link(m.from_user)} (@{user[3]})\n"
+            f"🚗 Moshina: {data['car_name']}\n"
+            f"💰 Narx: {data['car_price']} so'm"
+        ),
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+# --- ADMIN APPROVAL / REJECTION ---
+@dp.callback_query(F.data.startswith(("approve:", "reject:")))
+async def admin_action(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Bul buyrıq tek xojayın ushın!", show_alert=True)
+        return
+    
+    action, order_id_str = c.data.split(":")
+    order_id = int(order_id_str)
+    
+    if action == "approve":
+        res = db_update_order_status(order_id, "approved")
+        if res:
+            u_id, o_type, details = res
+            if "úy" in o_type.lower() or "dizayn" in o_type.lower():
+                db_update_house_status(u_id, o_type)
+            try:
+                await bot.send_message(u_id, f"✅ Sizdiń '{o_type}' buyırtpańız Xojayın tárepinen tastiqlandı! 🎉")
+            except Exception:
+                pass
+        await c.message.edit_caption(caption=c.message.caption + "\n\n**STATUS: ✅ TASTIQLANDI**", parse_mode="Markdown")
+        await c.answer("Buyırtpa tastiqlandı!")
+    else:
+        res = db_update_order_status(order_id, "rejected")
+        if res:
+            u_id, o_type, _ = res
+            try:
+                await bot.send_message(u_id, f"❌ Sizdiń '{o_type}' buyırtpańız biykarlendi.")
+            except Exception:
+                pass
+        await c.message.edit_caption(caption=c.message.caption + "\n\n**STATUS: ❌ BİYKARTLANDI**", parse_mode="Markdown")
+        await c.answer("Buyırtpa biykarlendi.")
 
 
 @dp.message()
 async def other(m: Message):
-    await m.answer("Úy tańlaw ushın /start basıń 🏠")
+    user = db_get_user(m.from_user.id)
+    is_owner = (m.from_user.id == OWNER_ID)
+    if not user or not user[3]:
+        await m.answer("Sálem! 👋 Instagram nikińizdi jazıń (mısalı: @nikiniz)")
+        return
+    await m.answer("Xizmet tańlaw ushın menyudan paydalanıń 🏠", reply_markup=main_menu_kb(is_owner))
 
 
 async def main():
